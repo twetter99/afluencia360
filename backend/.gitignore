@@ -1,0 +1,24 @@
+node_modules/
+.env
+.env.local
+.env.*.local
+
+# Credenciales Firebase / GCP
+config/serviceAccountKey.json
+*adminsdk*.json
+*service*account*.json
+
+# Carpeta de archivos de prueba / desarrollo
+Subida Exel /
+
+# Builds
+dist/
+
+# Archivos subidos
+uploads/
+*.xlsx
+*.xls
+plantilla_afluencia360.xlsx
+
+# OS
+.DS_Store
