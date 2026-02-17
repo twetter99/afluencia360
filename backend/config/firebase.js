@@ -7,8 +7,15 @@ let firestoreReady = false;
 
 async function initializeFirebase() {
   try {
-    const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './config/serviceAccountKey.json';
-    const serviceAccount = require(path.resolve(serviceAccountPath));
+    // Soportar credenciales por variable de entorno (Vercel/producción)
+    // o por archivo local (desarrollo)
+    let serviceAccount;
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    } else {
+      const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './config/serviceAccountKey.json';
+      serviceAccount = require(path.resolve(serviceAccountPath));
+    }
 
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
