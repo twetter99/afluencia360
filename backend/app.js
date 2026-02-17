@@ -13,6 +13,8 @@ const app = express();
 // Middleware
 const allowedOrigins = [
   process.env.FRONTEND_URL || 'http://localhost:5173',
+  'https://app.afluencia360.com',
+  'https://afluencia360.vercel.app',
   /\.vercel\.app$/
 ];
 
