@@ -402,7 +402,7 @@ router.post('/manual', upload.single('file'), async (req, res) => {
     }
 
     // Procesar el Excel con el procesador de marquesinas
-    const processed = processMarquesinaExcel(req.file.buffer, req.file.originalname);
+    const processed = processMarquesinaExcel(req.file.buffer, req.file.originalname, { targetDate: date });
 
     // Sobreescribir meta con los valores del usuario (NO autodetectar)
     processed.meta.location = code;

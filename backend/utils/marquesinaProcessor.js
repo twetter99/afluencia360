@@ -15,6 +15,24 @@
 
 const XLSX = require('xlsx');
 
+const COMPACT_COL = {
+  unit: 0,
+  people_in: 1,
+  adult: 2,
+  children: 3,
+  gender_unknown: 4,
+  male: 5,
+  female: 6,
+  age_unknown: 7,
+  age_lt10: 8,
+  age_10_16: 9,
+  age_17_30: 10,
+  age_31_45: 11,
+  age_46_60: 12,
+  age_gt60: 13,
+  time: 14,
+};
+
 // ─── Mapeo COMPLETO de las 42 columnas del Schema Query ──────────
 const COL = {
   unit:               0,   // A – Unidad / hora
@@ -67,7 +85,12 @@ const COL = {
 };
 
 // ─── Función principal ────────────────────────────────────────────
-function processMarquesinaExcel(fileBuffer, filename) {
+function processMarquesinaExcel(fileBuffer, filename, options = {}) {
+  if (filename && typeof filename === 'object') {
+    options = filename;
+    filename = options.filename;
+  }
+
   const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
 
   // Buscar la pestaña "Schema Query"
@@ -85,16 +108,25 @@ function processMarquesinaExcel(fileBuffer, filename) {
   const headers = raw[0];
   const dataRows = raw.slice(1);
 
+  if (isCompactDailySchema(headers)) {
+    return processCompactDailySchema({ dataRows, workbook, filename, options });
+  }
+
   // ─── Filtrar filas válidas y capturar fila Total ───────────────
   let totalsRow = null;
   const validRows = dataRows.filter((row) => {
-    const unit = String(row[COL.unit] || '').toLowerCase();
+    const unit = String(row[COL.unit] || '').trim().toLowerCase();
     if (unit === 'total') {
       totalsRow = row; // Guardar fila oficial de totales
       return false;
     }
-    const totalPeople = num(row[COL.total_people]);
-    return totalPeople > 0;
+
+    const timestamp = parseTimestamp(row[COL.time]);
+    if (Number.isNaN(timestamp.getTime())) {
+      return false;
+    }
+
+    return rowHasActivity(row);
   });
 
   if (validRows.length === 0) {
@@ -105,7 +137,7 @@ function processMarquesinaExcel(fileBuffer, filename) {
   const firstTimestamp = parseTimestamp(validRows[0][COL.time]);
   const lastTimestamp = parseTimestamp(validRows[validRows.length - 1][COL.time]);
   const unitName = String(validRows[0][COL.unit]);
-  const date = firstTimestamp.toISOString().split('T')[0]; // YYYY-MM-DD
+  const date = formatDateLocal(firstTimestamp); // YYYY-MM-DD
 
   // ─── Identificador de marquesina ──────────────────────────────
   // Prioridad:
@@ -161,9 +193,9 @@ function processMarquesinaExcel(fileBuffer, filename) {
   // ─── Procesar hora a hora ─────────────────────────────────────
   const hourly = validRows.map((row) => {
     const timestamp = parseTimestamp(row[COL.time]);
-    const hour = timestamp.toISOString().substring(11, 16); // "HH:MM"
+    const hour = formatTimeLocal(timestamp); // "HH:MM"
 
-    const detected      = num(row[COL.total_people]);
+    const detected      = getDetectedCount(row);
     const male          = num(row[COL.male]);
     const female        = num(row[COL.female]);
     const gender_unknown = num(row[COL.gender_unknown]);
@@ -501,6 +533,254 @@ function num(val) {
   return isNaN(n) ? 0 : n;
 }
 
+function isCompactDailySchema(headers = []) {
+  const normalized = headers.map(normalizeCompactHeader);
+  const requiredHeaders = [
+    'unit',
+    'people in',
+    'adult',
+    'children',
+    'gender unknown',
+    'male',
+    'female',
+    'age unknown',
+    '<10',
+    '10-16',
+    '17-30',
+    '31-45',
+    '46-60',
+    '>60',
+    'time',
+  ];
+
+  return requiredHeaders.every((header) => normalized.includes(header));
+}
+
+function normalizeCompactHeader(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/~/g, '-')
+    .replace(/\s+/g, ' ');
+}
+
+function toDateKey(value) {
+  if (typeof value === 'string') {
+    const match = value.trim().match(/^(\d{4}-\d{2}-\d{2})/);
+    if (match) return match[1];
+  }
+
+  const date = parseTimestamp(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return formatDateLocal(date);
+}
+
+function processCompactDailySchema({ dataRows, workbook, filename, options = {} }) {
+  let totalsRow = null;
+  const validRows = dataRows.filter((row) => {
+    const unit = String(row[COMPACT_COL.unit] || '').trim().toLowerCase();
+    if (unit === 'total') {
+      totalsRow = row;
+      return false;
+    }
+
+    const dateKey = toDateKey(row[COMPACT_COL.time]);
+    if (!dateKey) return false;
+
+    return num(row[COMPACT_COL.people_in]) > 0;
+  });
+
+  if (validRows.length === 0) {
+    throw new Error('El Excel no contiene días válidos con actividad.');
+  }
+
+  const targetDate = options.targetDate || options.date || null;
+  const selectedRows = targetDate
+    ? validRows.filter((row) => toDateKey(row[COMPACT_COL.time]) === targetDate)
+    : [validRows.reduce((latest, row) => {
+        const latestTime = parseTimestamp(latest[COMPACT_COL.time]).getTime();
+        const rowTime = parseTimestamp(row[COMPACT_COL.time]).getTime();
+        return rowTime > latestTime ? row : latest;
+      })];
+
+  if (selectedRows.length === 0) {
+    throw new Error(`No se encontraron datos para la fecha ${targetDate} en el Excel.`);
+  }
+
+  const row = selectedRows[0];
+  const timestamp = parseTimestamp(row[COMPACT_COL.time]);
+  const date = toDateKey(row[COMPACT_COL.time]);
+  const unitName = String(row[COMPACT_COL.unit] || '').trim();
+  const location = extractMarquesinaId(filename, workbook.SheetNames, unitName);
+
+  const detected = num(row[COMPACT_COL.people_in]);
+  const male = num(row[COMPACT_COL.male]);
+  const female = num(row[COMPACT_COL.female]);
+  const genderUnknown = num(row[COMPACT_COL.gender_unknown]);
+  const identified = male + female + genderUnknown;
+  const notIdentified = Math.max(0, detected - identified);
+  const ageLt10 = num(row[COMPACT_COL.age_lt10]);
+  const age10_16 = num(row[COMPACT_COL.age_10_16]);
+  const age17_30 = num(row[COMPACT_COL.age_17_30]);
+  const age31_45 = num(row[COMPACT_COL.age_31_45]);
+  const age46_60 = num(row[COMPACT_COL.age_46_60]);
+  const ageGt60 = num(row[COMPACT_COL.age_gt60]);
+  const ageUnknown = num(row[COMPACT_COL.age_unknown]);
+  const adult = num(row[COMPACT_COL.adult]);
+  const children = num(row[COMPACT_COL.children]);
+
+  const ageBuckets = [
+    { hour: '00:00', detected, identified, not_identified: notIdentified, value: ageLt10 + age10_16 + age17_30 + age31_45 + age46_60 + ageGt60 + ageUnknown },
+  ];
+  const dominantAge = [
+    { label: '<10', value: ageLt10 },
+    { label: '10-16', value: age10_16 },
+    { label: '17-30', value: age17_30 },
+    { label: '31-45', value: age31_45 },
+    { label: '46-60', value: age46_60 },
+    { label: '>60', value: ageGt60 },
+  ].reduce((max, item) => item.value > max.value ? item : max, { label: 'N/D', value: 0 });
+
+  return {
+    meta: {
+      location,
+      date,
+      measurement_start: null,
+      measurement_end: null,
+      active_hours: 0,
+      note: 'Archivo diario agregado; no incluye desglose horario',
+      processed_at: new Date().toISOString(),
+      source_format: 'schema-query-daily-compact',
+      source_timestamp: timestamp.toISOString(),
+    },
+    summary: {
+      total_detected: detected,
+      total_identified: identified,
+      total_not_identified: notIdentified,
+      identification_rate: pct(identified, detected),
+      avg_dwell_minutes: 0,
+      peak_hour: null,
+      traffic: {
+        entry_lot: 0,
+        outgoing_batch: 0,
+        people_detained: 0,
+        people_in: detected,
+        people_out: 0,
+        passby: 0,
+        turnback: 0,
+      },
+      people: {
+        adult,
+        children,
+        residents: 0,
+        employee_entry: 0,
+        customers_enter: 0,
+        employees_entering: 0,
+      },
+      vehicles: {
+        vehicle_entry: 0,
+        vehicle_exit: 0,
+        total_vehicles: 0,
+      },
+      deduplicated: 0,
+    },
+    gender: {
+      male: { count: male, pct: pct(male, detected) },
+      female: { count: female, pct: pct(female, detected) },
+      unknown: { count: genderUnknown, pct: pct(genderUnknown, detected) },
+      not_identified: { count: notIdentified, pct: pct(notIdentified, detected) },
+    },
+    age: {
+      '<10': { count: ageLt10, pct: pct(ageLt10, detected) },
+      '10-16': { count: age10_16, pct: pct(age10_16, detected) },
+      '17-30': { count: age17_30, pct: pct(age17_30, detected) },
+      '31-45': { count: age31_45, pct: pct(age31_45, detected) },
+      '46-60': { count: age46_60, pct: pct(age46_60, detected) },
+      '>60': { count: ageGt60, pct: pct(ageGt60, detected) },
+      unknown: { count: ageUnknown, pct: pct(ageUnknown, detected) },
+      not_identified: { count: notIdentified, pct: pct(notIdentified, detected) },
+    },
+    gender_g2: null,
+    age_g2: null,
+    officialTotals: totalsRow ? {
+      people_in: num(totalsRow[COMPACT_COL.people_in]),
+      adult: num(totalsRow[COMPACT_COL.adult]),
+      children: num(totalsRow[COMPACT_COL.children]),
+      male: num(totalsRow[COMPACT_COL.male]),
+      female: num(totalsRow[COMPACT_COL.female]),
+      gender_unknown: num(totalsRow[COMPACT_COL.gender_unknown]),
+      age_unknown: num(totalsRow[COMPACT_COL.age_unknown]),
+      age_lt10: num(totalsRow[COMPACT_COL.age_lt10]),
+      age_10_16: num(totalsRow[COMPACT_COL.age_10_16]),
+      age_17_30: num(totalsRow[COMPACT_COL.age_17_30]),
+      age_31_45: num(totalsRow[COMPACT_COL.age_31_45]),
+      age_46_60: num(totalsRow[COMPACT_COL.age_46_60]),
+      age_gt60: num(totalsRow[COMPACT_COL.age_gt60]),
+    } : null,
+    observations: [
+      `Archivo diario agregado para ${date} con ${detected} personas detectadas.`,
+      `Distribución de género: ${male} hombres, ${female} mujeres y ${genderUnknown} sin clasificar.`,
+      `Rango de edad dominante: ${dominantAge.label} con ${dominantAge.value} personas.`,
+      'El archivo no contiene desglose horario; por eso no se calcula hora pico.',
+    ],
+    hourly: [],
+  };
+}
+
+function getDetectedCount(row) {
+  const totalPeople = num(row[COL.total_people]);
+  if (totalPeople > 0) return totalPeople;
+
+  const identified = num(row[COL.male]) + num(row[COL.female]) + num(row[COL.gender_unknown]);
+  const demographicTotal =
+    num(row[COL.age_unknown]) +
+    num(row[COL.age_lt10]) +
+    num(row[COL.age_10_16]) +
+    num(row[COL.age_17_30]) +
+    num(row[COL.age_31_45]) +
+    num(row[COL.age_46_60]) +
+    num(row[COL.age_gt60]);
+  const peopleTotal =
+    num(row[COL.adult]) +
+    num(row[COL.children]) +
+    num(row[COL.residents]) +
+    num(row[COL.employee_entry]) +
+    num(row[COL.customers_enter]);
+
+  return Math.max(
+    identified,
+    demographicTotal,
+    peopleTotal,
+    num(row[COL.deduplicated]),
+    num(row[COL.people_in]),
+    num(row[COL.people_out]),
+    num(row[COL.entry_lot]),
+    num(row[COL.outgoing_batch])
+  );
+}
+
+function rowHasActivity(row) {
+  return getDetectedCount(row) > 0 || [
+    COL.passby,
+    COL.turnback,
+    COL.people_detained,
+    COL.vehicle_entry,
+    COL.vehicle_exit,
+    COL.total_vehicles,
+    COL.employees_entering,
+    COL.male_g2,
+    COL.female_g2,
+    COL.gender_unknown_g2,
+    COL.age_unknown_g2,
+    COL.age_lt10_g2,
+    COL.age_10_16_g2,
+    COL.age_17_30_g2,
+    COL.age_31_45_g2,
+    COL.age_46_60_g2,
+    COL.age_gt60_g2,
+  ].some((index) => num(row[index]) > 0);
+}
+
 function pct(value, total) {
   if (total === 0) return 0;
   return Math.round((value / total) * 1000) / 10;
@@ -511,7 +791,34 @@ function parseTimestamp(val) {
   if (typeof val === 'number') {
     return new Date(Math.round((val - 25569) * 86400 * 1000));
   }
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    const match = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/);
+    if (match) {
+      const [, year, month, day, hour = '00', minute = '00', second = '00'] = match;
+      return new Date(
+        Number(year),
+        Number(month) - 1,
+        Number(day),
+        Number(hour),
+        Number(minute),
+        Number(second)
+      );
+    }
+  }
   return new Date(String(val));
+}
+
+function formatDateLocal(date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'),
+  ].join('-');
+}
+
+function formatTimeLocal(date) {
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 }
 
 /**
