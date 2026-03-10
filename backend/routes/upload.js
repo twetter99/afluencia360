@@ -2,7 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const { parseExcelBuffer } = require('../utils/excelParser');
-const { processMarquesinaExcel, isMarquesinaExcel } = require('../utils/marquesinaProcessor');
+const { processMarquesinaExcel, processMarquesinaExcelBatch, isMarquesinaExcel } = require('../utils/marquesinaProcessor');
 const {
   saveRecord,
   createUpload,
@@ -69,6 +69,91 @@ async function makeValidationErrors(records) {
   return errors;
 }
 
+function buildAfluenciaRecordFromProcessed(processed, stopCode, stopName) {
+  const g = processed.gender || {};
+  const a = processed.age || {};
+  const totalDetected = processed.summary.total_detected || 0;
+  const identified = processed.summary.total_identified || 0;
+
+  return {
+    date: processed.meta.date,
+    stopCode,
+    entity: stopName || stopCode,
+    totals: {
+      adults: processed.summary.people?.adult || identified,
+      children: processed.summary.people?.children || 0,
+      afterDeduplication: processed.summary.deduplicated || 0,
+      totalNumber: totalDetected,
+      heavyEmployees: processed.summary.people?.employees_entering || 0
+    },
+    gender: {
+      man: g.male?.count || 0,
+      woman: g.female?.count || 0,
+      unknown: g.unknown?.count || 0
+    },
+    age: {
+      '0-9':   a['<10']?.count   || 0,
+      '10-16': a['10-16']?.count || 0,
+      '17-30': a['17-30']?.count || 0,
+      '31-45': a['31-45']?.count || 0,
+      '46-60': a['46-60']?.count || 0,
+      '60+':   a['>60']?.count   || 0,
+      unknown: a.unknown?.count || 0
+    },
+    ageHeavy: {
+      '0-9': 0, '10-16': 0, '17-30': 0, '31-45': 0, '46-60': 0, '60+': 0, unknown: 0
+    },
+    residenceTime: `00:${String(processed.summary.avg_dwell_minutes || 0).padStart(2, '0')}:00`,
+    passengerFlow: null,
+    hourly: (processed.hourly || []).map(h => ({
+      hour: h.hour,
+      entryLot: h.entry_lot || 0,
+      outgoingBatch: h.outgoing_batch || 0,
+      totalPersons: h.detected || 0,
+      peopleDet: h.people_detained || 0,
+      peopleIn: h.people_in || 0,
+      peopleOut: h.people_out || 0,
+      passby: h.passby || 0,
+      turnback: h.turnback || 0,
+      adult: h.adult || 0,
+      children: h.children || 0,
+      residents: h.residents || 0,
+      employeeEntry: h.employee_entry || 0,
+      customersEnter: h.customers_enter || 0,
+      vehicleEntry: h.vehicle_entry || 0,
+      vehicleExit: h.vehicle_exit || 0,
+      deduplicated: h.deduplicated || 0,
+      totalVehicles: h.total_vehicles || 0,
+      employeesEntering: h.employees_entering || 0,
+      gender: h.gender || {},
+      age: h.age || {},
+      genderG2: h.gender_g2 || {},
+      ageG2: h.age_g2 || {},
+      avgDwellMinutes: h.avg_dwell_minutes || 0,
+    })),
+    peakHour: processed.summary.peak_hour || null,
+    trafficTotals: {
+      entryLot: processed.summary.traffic?.entry_lot || 0,
+      outgoingBatch: processed.summary.traffic?.outgoing_batch || 0,
+      peopleDet: processed.summary.traffic?.people_detained || 0,
+      peopleIn: processed.summary.traffic?.people_in || 0,
+      peopleOut: processed.summary.traffic?.people_out || 0,
+      passby: processed.summary.traffic?.passby || 0,
+      turnback: processed.summary.traffic?.turnback || 0,
+    },
+    iotReport: {
+      meta: processed.meta,
+      summary: processed.summary,
+      gender: processed.gender,
+      age: processed.age,
+      genderG2: processed.gender_g2 || null,
+      ageG2: processed.age_g2 || null,
+      officialTotals: processed.officialTotals || null,
+      observations: processed.observations || [],
+    }
+  };
+}
+
 // POST /api/upload - Subir, validar y procesar en una operación
 // Auto-detecta si es un Excel IoT de marquesina (pestaña "Schema Query")
 // o el formato clásico de afluencia.
@@ -127,7 +212,7 @@ router.post('/', upload.single('file'), async (req, res) => {
           gender: {
             man: g.male?.count || 0,
             woman: g.female?.count || 0,
-            unknown: (g.unknown?.count || 0) + (g.not_identified?.count || 0)
+            unknown: g.unknown?.count || 0
           },
           age: {
             '0-9':   a['<10']?.count   || 0,
@@ -136,7 +221,7 @@ router.post('/', upload.single('file'), async (req, res) => {
             '31-45': a['31-45']?.count  || 0,
             '46-60': a['46-60']?.count  || 0,
             '60+':   a['>60']?.count    || 0,
-            unknown: (a.unknown?.count || 0) + (a.not_identified?.count || 0)
+            unknown: a.unknown?.count || 0
           },
           ageHeavy: {
             '0-9': 0, '10-16': 0, '17-30': 0, '31-45': 0, '46-60': 0, '60+': 0, unknown: 0
@@ -387,8 +472,15 @@ router.post('/manual', upload.single('file'), async (req, res) => {
       return res.status(404).json({ success: false, error: `La marquesina ${code} no está dada de alta en el catálogo` });
     }
 
-    // Verificar duplicado
-    if (!force) {
+    const processedBatch = processMarquesinaExcelBatch(req.file.buffer, req.file.originalname, {
+      targetDate: date,
+      importAll: true,
+    });
+
+    const isBatchImport = processedBatch.length > 1;
+
+    // Verificar duplicado solo en importación de un único día
+    if (!force && !isBatchImport) {
       const existing = await getMarquesinaDay(date, code);
       if (existing) {
         return res.status(409).json({
@@ -401,131 +493,52 @@ router.post('/manual', upload.single('file'), async (req, res) => {
       }
     }
 
-    // Procesar el Excel con el procesador de marquesinas
-    const processed = processMarquesinaExcel(req.file.buffer, req.file.originalname, { targetDate: date });
+    let insertedDays = 0;
+    let updatedDays = 0;
+    let insertedRecords = 0;
+    let updatedRecords = 0;
+    let totalDetected = 0;
 
-    // Sobreescribir meta con los valores del usuario (NO autodetectar)
-    processed.meta.location = code;
-    processed.meta.date = date;
+    for (const processed of processedBatch) {
+      processed.meta.location = code;
 
-    // Guardar en marquesinas/{code}/days/{date}
-    const saveResult = await saveMarquesinaDay(processed);
+      const saveResult = await saveMarquesinaDay(processed);
+      if (saveResult.action === 'updated') updatedDays += 1;
+      else insertedDays += 1;
 
-    // Si se está reemplazando, borrar el record anterior de afluencia_records
-    if (force) {
-      try {
-        const existingRecords = await getRecords({ entity: code, startDate: date, endDate: date });
-        if (existingRecords && existingRecords.length > 0) {
-          for (const rec of existingRecords) {
-            if (rec.id && rec.stopCode === code) {
-              await deleteRecord(rec.id);
-            }
-          }
-        }
-      } catch (cleanErr) {
-        console.warn(`⚠️  No se pudo limpiar records anteriores: ${cleanErr.message}`);
-      }
+      const afluenciaRecord = buildAfluenciaRecordFromProcessed(processed, code, stop.name || code);
+      const recordResult = await saveRecord(afluenciaRecord, {});
+      if (recordResult.action === 'updated') updatedRecords += 1;
+      else insertedRecords += 1;
+
+      totalDetected += processed.summary.total_detected || 0;
     }
 
-    // Puente: guardar en afluencia_records para el Dashboard
-    const g = processed.gender || {};
-    const a = processed.age || {};
-    const totalDetected = processed.summary.total_detected || 0;
-    const identified = processed.summary.total_identified || 0;
-
-    const afluenciaRecord = {
-      date,
-      stopCode: code,
-      entity: stop.name || code,
-      totals: {
-        adults: processed.summary.people?.adult || identified,
-        children: processed.summary.people?.children || 0,
-        afterDeduplication: processed.summary.deduplicated || 0,
-        totalNumber: totalDetected,
-        heavyEmployees: processed.summary.people?.employees_entering || 0
-      },
-      gender: {
-        man: g.male?.count || 0,
-        woman: g.female?.count || 0,
-        unknown: (g.unknown?.count || 0) + (g.not_identified?.count || 0)
-      },
-      age: {
-        '0-9':   a['<10']?.count   || 0,
-        '10-16': a['10-16']?.count  || 0,
-        '17-30': a['17-30']?.count  || 0,
-        '31-45': a['31-45']?.count  || 0,
-        '46-60': a['46-60']?.count  || 0,
-        '60+':   a['>60']?.count    || 0,
-        unknown: (a.unknown?.count || 0) + (a.not_identified?.count || 0)
-      },
-      ageHeavy: {
-        '0-9': 0, '10-16': 0, '17-30': 0, '31-45': 0, '46-60': 0, '60+': 0, unknown: 0
-      },
-      residenceTime: `00:${String(processed.summary.avg_dwell_minutes || 0).padStart(2, '0')}:00`,
-      passengerFlow: null,
-      hourly: (processed.hourly || []).map(h => ({
-        hour: h.hour,
-        entryLot: h.entry_lot || 0,
-        outgoingBatch: h.outgoing_batch || 0,
-        totalPersons: h.detected || 0,
-        peopleDet: h.people_detained || 0,
-        peopleIn: h.people_in || 0,
-        peopleOut: h.people_out || 0,
-        passby: h.passby || 0,
-        turnback: h.turnback || 0,
-        adult: h.adult || 0,
-        children: h.children || 0,
-        residents: h.residents || 0,
-        employeeEntry: h.employee_entry || 0,
-        customersEnter: h.customers_enter || 0,
-        vehicleEntry: h.vehicle_entry || 0,
-        vehicleExit: h.vehicle_exit || 0,
-        deduplicated: h.deduplicated || 0,
-        totalVehicles: h.total_vehicles || 0,
-        employeesEntering: h.employees_entering || 0,
-        gender: h.gender || {},
-        age: h.age || {},
-        genderG2: h.gender_g2 || {},
-        ageG2: h.age_g2 || {},
-        avgDwellMinutes: h.avg_dwell_minutes || 0,
-      })),
-      peakHour: processed.summary.peak_hour || null,
-      trafficTotals: {
-        entryLot: processed.summary.traffic?.entry_lot || 0,
-        outgoingBatch: processed.summary.traffic?.outgoing_batch || 0,
-        peopleDet: processed.summary.traffic?.people_detained || 0,
-        peopleIn: processed.summary.traffic?.people_in || 0,
-        peopleOut: processed.summary.traffic?.people_out || 0,
-        passby: processed.summary.traffic?.passby || 0,
-        turnback: processed.summary.traffic?.turnback || 0,
-      },
-      iotReport: {
-        meta: processed.meta,
-        summary: processed.summary,
-        gender: processed.gender,
-        age: processed.age,
-        genderG2: processed.gender_g2 || null,
-        ageG2: processed.age_g2 || null,
-        officialTotals: processed.officialTotals || null,
-        observations: processed.observations || [],
-      }
-    };
-
-    await saveRecord(afluenciaRecord, {});
+    const firstProcessed = processedBatch[0];
+    const lastProcessed = processedBatch[processedBatch.length - 1];
 
     return res.json({
       success: true,
       type: 'marquesina',
-      message: `Excel procesado para ${stop.name || code} — ${date}`,
+      message: isBatchImport
+        ? `Excel procesado para ${stop.name || code} — ${processedBatch.length} días importados`
+        : `Excel procesado para ${stop.name || code} — ${firstProcessed.meta.date}`,
       data: {
         location: code,
         stopName: stop.name,
-        date,
-        activeHours: processed.meta.active_hours,
+        date: isBatchImport ? null : firstProcessed.meta.date,
+        from: firstProcessed.meta.date,
+        to: lastProcessed.meta.date,
+        processedDays: processedBatch.length,
+        activeHours: firstProcessed.meta.active_hours,
         totalDetected,
-        identificationRate: processed.summary.identification_rate,
-        peakHour: processed.summary.peak_hour,
-        action: force ? 'replaced' : saveResult.action
+        identificationRate: firstProcessed.summary.identification_rate,
+        peakHour: firstProcessed.summary.peak_hour,
+        insertedDays,
+        updatedDays,
+        insertedRecords,
+        updatedRecords,
+        action: isBatchImport ? 'batch-imported' : (force ? 'replaced' : (insertedDays > 0 ? 'saved' : 'updated'))
       }
     });
   } catch (error) {

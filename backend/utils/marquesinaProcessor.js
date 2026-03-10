@@ -473,6 +473,57 @@ function processMarquesinaExcel(fileBuffer, filename, options = {}) {
   return result;
 }
 
+function processMarquesinaExcelBatch(fileBuffer, filename, options = {}) {
+  if (filename && typeof filename === 'object') {
+    options = filename;
+    filename = options.filename;
+  }
+
+  const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
+  const sheetName = workbook.SheetNames.find(
+    (name) => name.toLowerCase().includes('schema query')
+  );
+
+  if (!sheetName) {
+    throw new Error('No se encontró la pestaña "Schema Query" en el Excel.');
+  }
+
+  const sheet = workbook.Sheets[sheetName];
+  const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: 0 });
+  const headers = raw[0] || [];
+  const dataRows = raw.slice(1);
+
+  if (!isCompactDailySchema(headers)) {
+    return [processMarquesinaExcel(fileBuffer, filename, options)];
+  }
+
+  const { totalsRow, validRows } = getCompactDailyValidRows(dataRows);
+  if (validRows.length === 0) {
+    throw new Error('El Excel no contiene días válidos con actividad.');
+  }
+
+  const targetDate = options.targetDate || options.date || null;
+  let rowsToProcess = validRows;
+
+  if (targetDate && !options.importAll) {
+    rowsToProcess = validRows.filter((row) => toDateKey(row[COMPACT_COL.time]) === targetDate);
+  } else if (!options.importAll) {
+    rowsToProcess = [validRows.reduce((latest, row) => {
+      const latestTime = parseTimestamp(latest[COMPACT_COL.time]).getTime();
+      const rowTime = parseTimestamp(row[COMPACT_COL.time]).getTime();
+      return rowTime > latestTime ? row : latest;
+    })];
+  }
+
+  if (rowsToProcess.length === 0) {
+    throw new Error(`No se encontraron datos para la fecha ${targetDate} en el Excel.`);
+  }
+
+  return rowsToProcess
+    .map((row) => buildCompactDailyResult({ row, totalsRow, workbook, filename }))
+    .sort((a, b) => a.meta.date.localeCompare(b.meta.date));
+}
+
 // ─── Generación automática de observaciones ──────────────────────
 function generateObservations(totals, hourly, peakHour, base, identified) {
   const obs = [];
@@ -576,19 +627,7 @@ function toDateKey(value) {
 }
 
 function processCompactDailySchema({ dataRows, workbook, filename, options = {} }) {
-  let totalsRow = null;
-  const validRows = dataRows.filter((row) => {
-    const unit = String(row[COMPACT_COL.unit] || '').trim().toLowerCase();
-    if (unit === 'total') {
-      totalsRow = row;
-      return false;
-    }
-
-    const dateKey = toDateKey(row[COMPACT_COL.time]);
-    if (!dateKey) return false;
-
-    return num(row[COMPACT_COL.people_in]) > 0;
-  });
+  const { totalsRow, validRows } = getCompactDailyValidRows(dataRows);
 
   if (validRows.length === 0) {
     throw new Error('El Excel no contiene días válidos con actividad.');
@@ -607,7 +646,28 @@ function processCompactDailySchema({ dataRows, workbook, filename, options = {} 
     throw new Error(`No se encontraron datos para la fecha ${targetDate} en el Excel.`);
   }
 
-  const row = selectedRows[0];
+  return buildCompactDailyResult({ row: selectedRows[0], totalsRow, workbook, filename });
+}
+
+function getCompactDailyValidRows(dataRows = []) {
+  let totalsRow = null;
+  const validRows = dataRows.filter((row) => {
+    const unit = String(row[COMPACT_COL.unit] || '').trim().toLowerCase();
+    if (unit === 'total') {
+      totalsRow = row;
+      return false;
+    }
+
+    const dateKey = toDateKey(row[COMPACT_COL.time]);
+    if (!dateKey) return false;
+
+    return num(row[COMPACT_COL.people_in]) > 0;
+  });
+
+  return { totalsRow, validRows };
+}
+
+function buildCompactDailyResult({ row, totalsRow, workbook, filename }) {
   const timestamp = parseTimestamp(row[COMPACT_COL.time]);
   const date = toDateKey(row[COMPACT_COL.time]);
   const unitName = String(row[COMPACT_COL.unit] || '').trim();
@@ -629,9 +689,6 @@ function processCompactDailySchema({ dataRows, workbook, filename, options = {} 
   const adult = num(row[COMPACT_COL.adult]);
   const children = num(row[COMPACT_COL.children]);
 
-  const ageBuckets = [
-    { hour: '00:00', detected, identified, not_identified: notIdentified, value: ageLt10 + age10_16 + age17_30 + age31_45 + age46_60 + ageGt60 + ageUnknown },
-  ];
   const dominantAge = [
     { label: '<10', value: ageLt10 },
     { label: '10-16', value: age10_16 },
@@ -899,4 +956,4 @@ function isMarquesinaExcel(buffer) {
   }
 }
 
-module.exports = { processMarquesinaExcel, isMarquesinaExcel };
+module.exports = { processMarquesinaExcel, processMarquesinaExcelBatch, isMarquesinaExcel };
